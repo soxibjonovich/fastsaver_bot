@@ -1,0 +1,8 @@
+.env
+.venv/
+.idea/
+.zed/
+.vscode/
+__pycache__/
+*.py[cod]
+.ruff_cache/

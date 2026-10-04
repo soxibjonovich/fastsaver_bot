@@ -1,0 +1,11 @@
+[project]
+name = "fastsaver-bot"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "aiogram>=3.31.0",
+    "httpx2>=2.13.1",
+    "pydantic>=2.13.5",
+    "pydantic-settings>=2.15.0",
+    "python-dotenv>=1.2.4",
+]
