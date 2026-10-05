@@ -1,11 +1,10 @@
+from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 
-from config import settings
 from bot.routers import register_routers
-
-from aiogram import Bot, Dispatcher
-from aiogram.client.session.aiohttp import AiohttpSession
+from config import settings
 
 # aiogram's 60s default covers the whole POST. Media bytes travel through this
 # session, so a full-size video upload outruns it and raises TelegramNetworkError.

@@ -1,8 +1,8 @@
 import asyncio
 import logging
+from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from functools import wraps
-from typing import NamedTuple
 
 from aiogram import F, Router, html
 from aiogram.exceptions import (
@@ -18,36 +18,66 @@ from bot.misc import fetch_url_info
 from bot.misc.schemas import FetchResponse, ItemInfo
 
 router = Router(name="main")
+logger = logging.getLogger(__name__)
+
 
 MAX_CAPTION_LEN = 1024
 DOWNLOAD_TIMEOUT = 120
 NETWORK_ATTEMPTS = 2
 RETRY_DELAY = 3.0
 
-MediaSender = Callable[..., Awaitable[Message]]
+Sender = Callable[..., Awaitable[Message]]
 
 
-class MediaStrategy(NamedTuple):
-    """How one media type reaches Telegram.
+# --------------------------------------------------------------------------- #
+# Strategies: ONLY know "which Message method" and "which kwargs for this type".
+# They know nothing about retries or delivery.
+# --------------------------------------------------------------------------- #
+class MediaStrategy(ABC):
+    @property
+    @abstractmethod
+    def method(self) -> str:
+        """Name of the aiogram Message method used to send this media type."""
 
-    Only video takes a thumbnail, and only as an InputFile: SendVideo rejects a
-    bare thumbnail URL, while SendPhoto silently drops the unknown field.
-    """
+    def build_kwargs(self, item: ItemInfo, caption: str) -> dict[str, object]:
+        kwargs: dict[str, object] = {"caption": caption[:MAX_CAPTION_LEN]}
+        if item.width:
+            kwargs["width"] = item.width
+        if item.height:
+            kwargs["height"] = item.height
+        return kwargs
 
-    method: str
-    supports_thumbnail: bool
+
+class VideoStrategy(MediaStrategy):
+    """Only video takes a thumbnail, and only as an InputFile: SendVideo rejects a
+    bare thumbnail URL, while SendPhoto silently drops the unknown field."""
+
+    method = "reply_video"
+
+    def build_kwargs(self, item: ItemInfo, caption: str) -> dict[str, object]:
+        kwargs = super().build_kwargs(item, caption)
+        if item.thumbnail_url:
+            kwargs["thumbnail"] = URLInputFile(
+                item.thumbnail_url.encoded_string(), timeout=DOWNLOAD_TIMEOUT
+            )
+        return kwargs
 
 
-# Strategy: one row per media type, resolved per message instance so subclasses
-# and test doubles still dispatch. Adding a type = adding a row here.
-STRATEGY_BY_TYPE: dict[str, MediaStrategy] = {
-    "video": MediaStrategy("reply_video", supports_thumbnail=True),
-    "image": MediaStrategy("reply_photo", supports_thumbnail=False),
+class PhotoStrategy(MediaStrategy):
+    method = "reply_photo"
+
+
+STRATEGIES: dict[str, MediaStrategy] = {
+    "video": VideoStrategy(),
+    "image": PhotoStrategy(),
 }
 
 
-def retry_without_thumbnail(fn: MediaSender) -> MediaSender:
-    """Cross-cutting policy: Telegram rejects oversized/invalid thumbnails, retry once bare."""
+# --------------------------------------------------------------------------- #
+# Cross-cutting retry policies (decorators)
+# --------------------------------------------------------------------------- #
+def retry_without_thumbnail(fn: Sender) -> Sender:
+    """Telegram rejects oversized/invalid thumbnails: retry once bare."""
 
     @wraps(fn)
     async def wrapper(*args: object, **kwargs: object) -> Message:
@@ -57,14 +87,14 @@ def retry_without_thumbnail(fn: MediaSender) -> MediaSender:
             except TelegramBadRequest:
                 if attempt or not kwargs.pop("thumbnail", None):
                     raise
-                logging.warning("thumbnail rejected, retrying without it")
+                logger.warning("thumbnail rejected, retrying without it")
         raise RuntimeError("unreachable")
 
     return wrapper
 
 
-def retry_on_network_error(fn: MediaSender) -> MediaSender:
-    """Cross-cutting policy: transport hiccups and 5xx are worth one more attempt."""
+def retry_on_network_error(fn: Sender) -> Sender:
+    """Transport hiccups and 5xx are worth one more attempt."""
 
     @wraps(fn)
     async def wrapper(*args: object, **kwargs: object) -> Message:
@@ -74,7 +104,7 @@ def retry_on_network_error(fn: MediaSender) -> MediaSender:
             except (TelegramNetworkError, TelegramServerError) as err:
                 if attempt == NETWORK_ATTEMPTS - 1:
                     raise
-                logging.warning(
+                logger.warning(
                     "telegram network error (%s), retrying in %ss", err, RETRY_DELAY
                 )
                 await asyncio.sleep(RETRY_DELAY)
@@ -83,39 +113,52 @@ def retry_on_network_error(fn: MediaSender) -> MediaSender:
     return wrapper
 
 
+# --------------------------------------------------------------------------- #
+# Context: picks a strategy and delivers. Strategies no longer call back into
+# module-level helpers, so the dependency flows one way.
+# --------------------------------------------------------------------------- #
 @retry_without_thumbnail
-async def dispatch(
-    sender: MediaSender, file: URLInputFile, **kwargs: object
-) -> Message:
+async def _upload_via_bot(sender: Sender, file: URLInputFile, **kwargs: object) -> Message:
     return await sender(file, **kwargs)
 
 
 @retry_on_network_error
-async def upload(message: Message, item: ItemInfo, caption: str = "") -> Message:
-    strategy = STRATEGY_BY_TYPE[item.type]
-    sender: MediaSender = getattr(message, strategy.method)
-    media_url = item.download_url.encoded_string()
-    kwargs: dict[str, object] = {"caption": caption[:MAX_CAPTION_LEN]}
-
-    if strategy.supports_thumbnail and item.thumbnail_url:
-        kwargs["thumbnail"] = URLInputFile(
-            item.thumbnail_url.encoded_string(), timeout=DOWNLOAD_TIMEOUT
-        )
-
-    # Preferred path: Telegram's servers fetch the media themselves. Nothing is
-    # uploaded, so a large file cannot outrun the session timeout.
+async def _deliver(
+    sender: Sender, media_url: str, kwargs: dict[str, object]
+) -> Message:
+    # Preferred: Telegram's servers fetch the media; nothing is uploaded by us.
     try:
         return await sender(media_url, **kwargs)
     except TelegramBadRequest as err:
-        logging.info("telegram would not fetch the url (%s), streaming via bot", err)
+        logger.info("telegram would not fetch the url (%s), streaming via bot", err)
 
     # Fallback: aiogram downloads and uploads. Slower, but survives CDNs that
-    # reject Telegram's fetcher or that exceed the remote-size limits.
-    return await dispatch(
+    # reject Telegram's fetcher or exceed remote-size limits.
+    return await _upload_via_bot(
         sender, URLInputFile(media_url, timeout=DOWNLOAD_TIMEOUT), **kwargs
     )
 
 
+class MediaSender:
+    """Context for the strategy pattern."""
+
+    def __init__(self, strategies: dict[str, MediaStrategy]) -> None:
+        self._strategies = strategies
+
+    async def send(self, message: Message, item: ItemInfo, caption: str = "") -> Message:
+        strategy = self._strategies[item.type]
+        sender: Sender = getattr(message, strategy.method)
+        return await _deliver(
+            sender, item.download_url.encoded_string(), strategy.build_kwargs(item, caption)
+        )
+
+
+media_sender = MediaSender(STRATEGIES)
+
+
+# --------------------------------------------------------------------------- #
+# Handlers
+# --------------------------------------------------------------------------- #
 def resolve_items(info: FetchResponse) -> list[ItemInfo]:
     """Album payloads carry `items`; single-media payloads carry the fields inline."""
     if info.items:
@@ -127,9 +170,9 @@ def resolve_items(info: FetchResponse) -> list[ItemInfo]:
 
 async def send_item(message: Message, item: ItemInfo, caption: str = "") -> None:
     try:
-        await upload(message, item, caption)
-    except TelegramAPIError as err:
-        logging.warning("send failed for %s: %s", item.type, err)
+        await media_sender.send(message, item, caption)
+    except (TelegramAPIError, KeyError) as err:  # KeyError: unknown media type
+        logger.warning("send failed for %s: %s", item.type, err)
         await message.reply(html.bold("Yuklab bo'lmadi."))
 
 

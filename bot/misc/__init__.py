@@ -1,7 +1,7 @@
 import httpx2
 
-from config import settings
 from bot.misc import schemas
+from config import settings
 
 
 async def fetch_url_info(url: str) -> schemas.FetchResponse | None:
@@ -15,6 +15,6 @@ async def fetch_url_info(url: str) -> schemas.FetchResponse | None:
         try:
             return schemas.FetchResponse.model_validate(response.json())
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(e)
         return None
