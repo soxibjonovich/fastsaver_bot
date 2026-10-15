@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from functools import wraps
+from itertools import cycle
 from typing import Any
 
 from aiogram import F, Router, html
@@ -217,6 +218,14 @@ async def _deliver(
 # --------------------------------------------------------------------------- #
 # Album: several items ride in ONE sendMediaGroup instead of one message each.
 # --------------------------------------------------------------------------- #
+def chunk_albums(items: list[ItemInfo]) -> list[list[ItemInfo]]:
+    """Telegram takes 2-10 items per album; a lone remainder goes on its own."""
+    return [
+        items[start : start + ALBUM_LIMIT]
+        for start in range(0, len(items), ALBUM_LIMIT)
+    ]
+
+
 def build_album_media(
     items: list[ItemInfo],
     caption: str,
@@ -274,16 +283,40 @@ async def _deliver_album(
 
 # --------------------------------------------------------------------------- #
 # Chat actions: the "typing…" / "sending photo…" hint. Telegram clears an action
-# after ~5s, so a background task re-arms it while we fetch and upload.
+# after ~5s, so a background task re-arms it while we fetch and upload. A mixed
+# album alternates hints, so the chat shows both what it holds and that we are
+# still working. Add more kinds here (voice, video_note, sticker…) as types grow.
 # --------------------------------------------------------------------------- #
 UPLOAD_ACTION: dict[str, ChatAction] = {
     "video": ChatAction.UPLOAD_VIDEO,
     "image": ChatAction.UPLOAD_PHOTO,
 }
+FALLBACK_ACTION = ChatAction.UPLOAD_DOCUMENT
+
+ChatActions = tuple[ChatAction, ...]
 
 
-async def _repeat_chat_action(message: Message, action: ChatAction) -> None:
-    while True:
+def upload_action(item: ItemInfo) -> ChatActions:
+    """One media type, one hint."""
+    return (UPLOAD_ACTION.get(item.type, FALLBACK_ACTION),)
+
+
+def album_action(items: list[ItemInfo]) -> ChatActions:
+    """Telegram takes a single hint per request, so a mixed album alternates."""
+    kinds = {item.type for item in items}
+    if len(kinds) > 1:
+        return (ChatAction.UPLOAD_PHOTO, ChatAction.UPLOAD_VIDEO)
+    if not kinds:
+        return (FALLBACK_ACTION,)
+    return upload_action(items[0])
+
+
+def _action_cycle(spec: ChatAction | ChatActions) -> ChatActions:
+    return (spec,) if isinstance(spec, ChatAction) else spec
+
+
+async def _repeat_chat_action(message: Message, actions: ChatActions) -> None:
+    for action in cycle(actions):
         try:
             await message.bot.send_chat_action(
                 message.chat.id, action, message_thread_id=message.message_thread_id
@@ -295,8 +328,10 @@ async def _repeat_chat_action(message: Message, action: ChatAction) -> None:
 
 
 @asynccontextmanager
-async def chat_action(message: Message, action: ChatAction) -> AsyncIterator[None]:
-    task = asyncio.create_task(_repeat_chat_action(message, action))
+async def chat_action(
+    message: Message, spec: ChatAction | ChatActions
+) -> AsyncIterator[None]:
+    task = asyncio.create_task(_repeat_chat_action(message, _action_cycle(spec)))
     try:
         yield
     finally:
@@ -324,15 +359,9 @@ class MediaSender:
 
     async def send_album(
         self, message: Message, items: list[ItemInfo], caption: str = ""
-    ) -> None:
-        """One album per up-to-ten items; a lone remainder goes on its own."""
-        for start in range(0, len(items), ALBUM_LIMIT):
-            chunk = items[start : start + ALBUM_LIMIT]
-            chunk_caption = caption if start == 0 else ""
-            if len(chunk) == 1:
-                await self.send(message, chunk[0], chunk_caption)
-            else:
-                await _deliver_album(message.reply_media_group, chunk, chunk_caption)
+    ) -> list[Message]:
+        """One sendMediaGroup call; Telegram wants 2-10 items."""
+        return await _deliver_album(message.reply_media_group, items, caption)
 
 
 media_sender = MediaSender(STRATEGIES)
@@ -351,9 +380,8 @@ def resolve_items(info: FetchResponse) -> list[ItemInfo]:
 
 
 async def send_item(message: Message, item: ItemInfo, caption: str = "") -> None:
-    action = UPLOAD_ACTION.get(item.type, ChatAction.UPLOAD_DOCUMENT)
     try:
-        async with chat_action(message, action):
+        async with chat_action(message, upload_action(item)):
             await media_sender.send(message, item, caption)
     except (TelegramAPIError, KeyError) as err:  # KeyError: unknown media type
         logger.warning("send failed for %s: %s", item.type, err)
@@ -363,15 +391,15 @@ async def send_item(message: Message, item: ItemInfo, caption: str = "") -> None
 async def send_album(
     message: Message, items: list[ItemInfo], caption: str = ""
 ) -> None:
-    # Telegram only knows one hint per request: video when the album is all video.
-    action = (
-        ChatAction.UPLOAD_VIDEO
-        if all(item.type == "video" for item in items)
-        else ChatAction.UPLOAD_PHOTO
-    )
     try:
-        async with chat_action(message, action):
-            await media_sender.send_album(message, items, caption)
+        # Chunked here, not in the sender, so each album gets its own upload hint.
+        for index, chunk in enumerate(chunk_albums(items)):
+            chunk_caption = caption if index == 0 else ""
+            async with chat_action(message, album_action(chunk)):
+                if len(chunk) == 1:
+                    await media_sender.send(message, chunk[0], chunk_caption)
+                else:
+                    await media_sender.send_album(message, chunk, chunk_caption)
     except (TelegramAPIError, KeyError) as err:  # KeyError: unknown media type
         logger.warning("album send failed: %s", err)
         await message.reply(html.bold("Yuklab bo'lmadi."))
